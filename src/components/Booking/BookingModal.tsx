@@ -5,6 +5,7 @@ import { BookingFormData } from '../../types';
 import { UserReservation } from '../../types/auth';
 import { useAuth } from '../../context/AuthContext';
 import { checkRoomAvailability, createReservationRequest } from '../../services/db/reservationService';
+import { supabase } from '../../lib/supabase'; // Idinagdag natin ito para makausap ang rooms at billing
 import { RoomDropdown } from '../UI/RoomDropdown';
 import { GuestDropdown } from '../UI/GuestDropdown';
 import { DatePickerInput } from '../UI/DatePickerInput';
@@ -95,50 +96,28 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const validate = () => {
     const newErrors: Partial<Record<keyof BookingFormData, string>> = {};
 
-    // 1. Room Type validation
-    if (!formData.roomType) {
-      newErrors.roomType = 'Please select a room type';
-    }
-
-    // 2. Dates validation (Mandatory check-in and check-out)
-    if (!formData.checkInDate) {
-      newErrors.checkInDate = 'Check-in date is required';
-    }
+    if (!formData.roomType) newErrors.roomType = 'Please select a room type';
+    if (!formData.checkInDate) newErrors.checkInDate = 'Check-in date is required';
     if (!formData.checkOutDate) {
       newErrors.checkOutDate = 'Check-out date is required';
     } else if (formData.checkInDate && formData.checkOutDate <= formData.checkInDate) {
       newErrors.checkOutDate = 'Check-out date must be after check-in date';
     }
 
-    // 3. Capacity enforcement (Room maximum guests)
     if (!formData.numberOfGuests || formData.numberOfGuests < 1) {
       newErrors.numberOfGuests = 'Please select at least 1 guest';
     } else if (formData.numberOfGuests > currentRoom.capacity) {
-      newErrors.numberOfGuests = `${currentRoom.name} accommodates up to ${currentRoom.capacity} guests (selected: ${formData.numberOfGuests}). Please reduce guest count or choose a larger room.`;
+      newErrors.numberOfGuests = `${currentRoom.name} accommodates up to ${currentRoom.capacity} guests.`;
     }
 
-    // 4. Contact validation
-    if (!formData.fullName.trim()) {
-      newErrors.fullName = 'Full guest name is required';
-    }
-    if (!formData.contactNumber.trim()) {
-      newErrors.contactNumber = 'Contact phone number is required';
-    }
-    if (!formData.email.trim() || !formData.email.includes('@')) {
-      newErrors.email = 'Valid email address is required';
-    }
+    if (!formData.fullName.trim()) newErrors.fullName = 'Full guest name is required';
+    if (!formData.contactNumber.trim()) newErrors.contactNumber = 'Contact phone number is required';
+    if (!formData.email.trim() || !formData.email.includes('@')) newErrors.email = 'Valid email address is required';
 
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
 
-  /**
-   * Handles booking form submission:
-   * 1. Validates guest inputs, dates, and room capacity.
-   * 2. Checks live room availability to prevent double-booking conflicts (Objective 1).
-   * 3. Submits reservation record to Supabase database (`public.reservations`).
-   */
-  
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
@@ -146,7 +125,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      // Objective 1: Check Live Calendar availability and prevent double bookings
       const selectedRoomObj = SAMPLE_ROOMS.find((r) => r.name === formData.roomType) || SAMPLE_ROOMS[0];
       const availability = await checkRoomAvailability({
         roomId: selectedRoomObj.id || formData.roomType.toLowerCase().replace(/\s+/g, '-'),
@@ -163,20 +141,35 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         return;
       }
 
-      // --- BAGONG CODE: COMPUTATION NG NIGHTS AT TOTAL PRICE ---
+      // Compute Total Price based on nights
       const checkIn = new Date(formData.checkInDate);
       const checkOut = new Date(formData.checkOutDate);
-      let nights = 1; // Default ay 1 night
+      let nights = 1;
       if (!isNaN(checkIn.getTime()) && !isNaN(checkOut.getTime())) {
         const diffTime = checkOut.getTime() - checkIn.getTime();
-        // I-convert ang milliseconds to days
         nights = Math.max(1, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
       }
       const computedTotal = (selectedRoomObj.rate || 0) * nights;
-      // --------------------------------------------------------
 
-      // Create a confirmed/pending reservation record
-      const newReservation: any = { // Nilagyan ko ng 'any' muna para hindi mag-error kung wala sa lumang type definition ang totalAmount
+      // UPDATE NG AVAILABLE ROOMS (Babawasan sa Inventory)
+      // Kunin muna ang isang available na unit ng kwartong ito
+      const { data: availableUnits } = await supabase
+        .from('room_units')
+        .select('*')
+        .eq('room_type', formData.roomType)
+        .eq('status', 'Available')
+        .limit(1);
+
+      if (availableUnits && availableUnits.length > 0) {
+        // I-update ito para maging "Reserved"
+        await supabase
+          .from('room_units')
+          .update({ status: 'Reserved' })
+          .eq('id', availableUnits[0].id);
+      }
+
+      // Create Reservation Payload
+      const newReservation: any = { 
         id: `res-${Date.now()}`,
         reservationCode: `DT-2026-${Math.floor(1000 + Math.random() * 9000)}`,
         roomName: formData.roomType,
@@ -184,7 +177,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         roomImage: selectedRoomObj.image,
         rate: selectedRoomObj.rate,
         ratePeriod: selectedRoomObj.ratePeriod,
-        totalAmount: computedTotal, // <-- DITO NATIN IPAPASA ANG COMPUTED TOTAL
+        totalAmount: computedTotal, 
         checkInDate: formData.checkInDate,
         checkOutDate: formData.checkOutDate,
         numberOfGuests: formData.numberOfGuests,
@@ -196,12 +189,31 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         bookedAt: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
       };
 
-      // Persist to database & active user session
+      // AUTOMATIC BILLING: Gagawa ng SOA sa billing_records
+      const invoicePayload = {
+        invoice_number: `INV-2026-${Math.floor(100 + Math.random() * 900)}`,
+        tenant_or_guest: formData.fullName.trim(),
+        room_or_bed: formData.roomType,
+        type: 'Transient Stay',
+        billing_period: `${formData.checkInDate} to ${formData.checkOutDate}`,
+        rent_amount: computedTotal,
+        water_amount: 0,
+        electricity_amount: 0,
+        deposit_amount: 0,
+        total_amount: computedTotal,
+        payment_status: 'Pending',
+        due_date: formData.checkInDate // Due on check-in date
+      };
+
+      // I-save sabay sa database
       await createReservationRequest(newReservation);
+      await supabase.from('billing_records').insert([invoicePayload]); // Awtomatikong billing record
+      
       addReservation(newReservation);
       setIsSubmitting(false);
       onSubmitSuccess(formData);
     } catch (err: any) {
+      console.error(err);
       setIsSubmitting(false);
       setErrors((prev) => ({
         ...prev,
@@ -214,7 +226,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in overflow-hidden">
       <div className="bg-white rounded-3xl max-w-xl w-full max-h-[92vh] sm:max-h-[90vh] shadow-2xl border border-stone-200/90 flex flex-col overflow-hidden transform-gpu">
         
-        {/* Pinned Header */}
         <div className="p-4 sm:p-6 pb-3 sm:pb-4 border-b border-stone-100 flex items-center justify-between flex-shrink-0">
           <div className="flex items-center gap-2.5 sm:gap-3.5">
             <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-full overflow-hidden border-2 border-gold-500 shadow-glow-gold flex-shrink-0 bg-pine-950">
@@ -243,7 +254,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </button>
         </div>
 
-        {/* Pinned Selected Room Summary Pill */}
         <div className="px-4 sm:px-6 py-2 sm:py-2.5 bg-gradient-to-r from-pine-50 via-cream-100 to-pine-50 border-b border-pine-100 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-2 text-xs text-pine-950 font-semibold flex-shrink-0">
           <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
             <BedDouble className="w-3.5 h-3.5 text-pine-700 flex-shrink-0" strokeWidth={2} />
@@ -255,11 +265,9 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           <span className="text-pine-800 font-bold font-serif whitespace-nowrap">{currentRoom.formattedRate}</span>
         </div>
 
-        {/* Scrollable Form Body (Scrollbar strictly contained inside white body) */}
         <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-3.5 sm:space-y-4 overscroll-contain flex flex-col justify-between">
           <div className="space-y-4">
           
-          {/* Staff Review Workflow Notice */}
           <div className="p-3 bg-amber-50/80 border border-amber-200/90 rounded-2xl flex items-center gap-2.5 text-xs text-amber-950 font-medium">
             <Clock className="w-4 h-4 text-amber-700 flex-shrink-0" />
             <span>
@@ -267,7 +275,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             </span>
           </div>
 
-          {/* Room Type Luxury Dropdown */}
           <div className="space-y-1">
             <RoomDropdown
               rooms={SAMPLE_ROOMS}
@@ -280,7 +287,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             )}
           </div>
 
-          {/* Dates Row with Mandatory Date Pickers */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <DatePickerInput
               label="Check-in Date"
@@ -313,7 +319,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             />
           </div>
 
-          {/* Number of Guests Luxury Dropdown with Room Capacity Enforcement */}
           <div className="space-y-1">
             <GuestDropdown
               value={formData.numberOfGuests}
@@ -329,7 +334,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             />
           </div>
 
-          {/* Guest Full Name */}
           <div className="space-y-1">
             <label className="text-xs font-bold text-pine-950 flex items-center gap-1.5 uppercase tracking-wider">
               <User className="w-3.5 h-3.5 text-pine-700" strokeWidth={2} />
@@ -352,7 +356,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             )}
           </div>
 
-          {/* Contact & Email Row */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1">
               <label className="text-xs font-bold text-pine-950 flex items-center gap-1.5 uppercase tracking-wider">
@@ -399,7 +402,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             </div>
           </div>
 
-          {/* Special Requests */}
           <div className="space-y-1">
             <label className="text-xs font-bold text-pine-950 flex items-center gap-1.5 uppercase tracking-wider">
               <span>Special Requests or Notes (Optional)</span>
@@ -414,7 +416,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </div>
           </div>
 
-          {/* Actions */}
           <div className="pt-3 border-t border-stone-100 flex items-center justify-end gap-3 flex-shrink-0">
             <button
               type="button"

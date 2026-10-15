@@ -166,16 +166,17 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
 
         if (isSupabaseConfigured()) {
           try {
-            const { data, error } = await supabase
+            // 1. Fetch Reservations
+            const { data: resData, error: resError } = await supabase
               .from('reservations')
               .select('*')
               .order('created_at', { ascending: false });
 
-            if (!error && data) {
+            if (!resError && resData) {
               const userEmail = user?.email?.toLowerCase().trim();
               const filtered = userEmail 
-                ? data.filter((r: any) => r.guest_email && r.guest_email.toLowerCase().trim() === userEmail)
-                : data;
+                ? resData.filter((r: any) => r.guest_email && r.guest_email.toLowerCase().trim() === userEmail)
+                : resData;
 
               const formattedReservations = filtered.map((r: any) => ({
                 id: r.id,
@@ -194,27 +195,84 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                 numberOfGuests: r.number_of_guests || 1,
                 specialRequests: r.special_requests || '',
                 cancellationReason: r.cancellation_reason || '',
+                physicalRoomNumber: r.physical_room_number || '', // NAKA-LINK NA SA DB
                 bookedAt: 'Recently'
               }));
               setLiveReservations(formattedReservations);
             }
+
+            // 2. Fetch Invoices from Supabase directly
+            const { data: invData, error: invError } = await supabase
+              .from('billing_records')
+              .select('*')
+              .order('created_at', { ascending: false });
+
+            let finalInvoices: any[] = [];
+            
+            if (!invError && invData) {
+              const myName = user?.name?.toLowerCase().trim();
+              const myInvoices = myName 
+                ? invData.filter((i: any) => i.tenant_or_guest?.toLowerCase().trim() === myName)
+                : invData;
+
+              // --- HIDE THE 100% INVOICE COMPLETELY ---
+              const cleanedInvoices = myInvoices.filter((inv: any) => {
+                if (inv.type === 'Transient Stay' && inv.payment_status === 'Pending') {
+                  return false; 
+                }
+                return true;
+              });
+
+              finalInvoices = cleanedInvoices.map((inv: any) => ({
+                id: String(inv.id),
+                invoiceNumber: inv.invoice_number,
+                tenantOrGuestName: inv.tenant_or_guest || '', 
+                roomOrBed: inv.room_or_bed,
+                stayType: inv.type,
+                billingPeriod: inv.billing_period,
+                rentAmount: Number(inv.rent_amount) || 0,
+                waterAmount: Number(inv.water_amount) || 0,
+                electricityAmount: Number(inv.electricity_amount) || 0,
+                depositAmount: Number(inv.deposit_amount) || 0,
+                totalAmount: Number(inv.total_amount) || 0,
+                paymentStatus: inv.payment_status,
+                dueDate: inv.due_date,
+                paymentReference: inv.payment_reference,
+                paymentMethod: inv.payment_method,
+                paidAt: inv.paid_at,
+                createdAt: inv.created_at || ''
+              }));
+            } else {
+               finalInvoices = await getLocalInvoices(user?.email);
+            }
+
+            setInvoices(finalInvoices);
+
+            // Auto-fill the payment amount and selected invoice
+            const firstPending = finalInvoices.find((i: ClientInvoice) => i.paymentStatus === 'Pending');
+            if (firstPending && !selectedInvoiceForPayment) {
+              setSelectedInvoiceForPayment(firstPending.id);
+              setPaymentAmount(firstPending.totalAmount);
+            }
+
           } catch (err) {
-            console.warn('Error fetching live reservations:', err);
+            console.warn('Error fetching portal data:', err);
           }
-        }
+        } else {
+          // If Supabase is not configured, load from local storage
+          const loadedInvoices = await getLocalInvoices(user?.email);
+          setInvoices(loadedInvoices);
 
-        const loadedInvoices = await getLocalInvoices(user?.email);
-        setInvoices(loadedInvoices);
-
-        const firstPending = loadedInvoices.find((i: ClientInvoice) => i.paymentStatus !== 'Paid');
-        if (firstPending) {
-          setSelectedInvoiceForPayment(firstPending.id);
-          setPaymentAmount(firstPending.totalAmount);
+          const firstPending = loadedInvoices.find((i: ClientInvoice) => i.paymentStatus !== 'Paid');
+          if (firstPending) {
+            setSelectedInvoiceForPayment(firstPending.id);
+            setPaymentAmount(firstPending.totalAmount);
+          }
         }
       }
     };
     loadPortalData();
-  }, [isOpen, initialTab, user?.email]);
+  }, [isOpen, initialTab, user?.email]); // TINANGGAL NA ANG ACTIVETAB DITO PARA HINDI MAG-GLITCH
 
   useEffect(() => {
     if (isOpen) {
@@ -306,24 +364,50 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
     }
 
     setIsSubmittingPayment(true);
-    const result = await submitOnlinePayment({
-      invoiceId: selectedInvoiceForPayment,
-      paymentMethod,
-      referenceNumber: referenceNumber.trim(),
-      accountName: accountName.trim() || user?.name,
-      amount: paymentAmount,
-      receiptFileOrUrl: receiptFilePreview || undefined
-    });
+
+    if (isSupabaseConfigured()) {
+      const { error } = await supabase
+        .from('billing_records')
+        .update({
+          payment_status: 'Paid',
+          payment_method: paymentMethod,
+          payment_reference: referenceNumber.trim(),
+          receipt_url: receiptFilePreview || null,
+          paid_at: new Date().toLocaleDateString()
+        })
+        .eq('id', selectedInvoiceForPayment);
+
+      if (error) {
+        console.error("Error updating invoice:", error);
+        alert("Error submitting payment details. Please check your connection and try again.");
+        setIsSubmittingPayment(false);
+        return;
+      }
+    } else {
+       // Legacy fallback para sa mock database service
+      await submitOnlinePayment({
+        invoiceId: selectedInvoiceForPayment,
+        paymentMethod,
+        referenceNumber: referenceNumber.trim(),
+        accountName: accountName.trim() || user?.name || '',
+        amount: paymentAmount,
+        receiptFileOrUrl: receiptFilePreview || undefined
+      });
+    }
 
     setIsSubmittingPayment(false);
-    if (result.success) {
-      setPaymentSuccessMsg(result.message);
-      const updatedInvoices = await getLocalInvoices(user?.email);
-      setInvoices(updatedInvoices);
-      setReferenceNumber('');
-      setReceiptFilePreview(null);
-      setTimeout(() => setPaymentSuccessMsg(null), 5000);
-    }
+    setPaymentSuccessMsg("Payment successfully verified and sent to Admin!");
+    
+    // I-update ang UI ng Client para maging 'Paid' agad at mawala ang Red Banner
+    setInvoices(prev => prev.map(inv => 
+      inv.id === selectedInvoiceForPayment 
+        ? { ...inv, paymentStatus: 'Paid', paymentReference: referenceNumber.trim(), paymentMethod: paymentMethod, paidAt: new Date().toLocaleDateString() } 
+        : inv
+    ));
+    
+    setReferenceNumber('');
+    setReceiptFilePreview(null);
+    setTimeout(() => setPaymentSuccessMsg(null), 5000);
   };
 
   const handleCustomerReply = async (e: React.FormEvent, inquiryId: string) => {
@@ -354,6 +438,8 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
       setIsSubmittingReply(null);
     }
   };
+
+  const pendingInvoices = invoices.filter(inv => inv.paymentStatus === 'Pending');
 
   return (
     <div
@@ -461,6 +547,29 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
           </button>
         </div>
 
+        {/* --- NEW ACTION REQUIRED BANNER --- */}
+        {pendingInvoices.length > 0 && activeTab !== 'payment' && (
+          <div className="mx-3 sm:mx-6 mt-4 p-3 sm:p-4 bg-rose-50 border border-rose-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-fade-in shadow-sm">
+            <div className="flex items-start sm:items-center gap-3">
+              <div className="w-8 h-8 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center flex-shrink-0">
+                <AlertTriangle className="w-4 h-4" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-rose-900">Action Required: Pending Downpayment</h4>
+                <p className="text-[11px] text-rose-700 mt-0.5">
+                  You have {pendingInvoices.length} pending invoice(s) amounting to ₱{pendingInvoices.reduce((sum, inv) => sum + inv.totalAmount, 0).toLocaleString()}. Please upload your payment receipt to confirm your reservation.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setActiveTab('payment')}
+              className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl whitespace-nowrap transition-colors shadow-xs cursor-pointer"
+            >
+              Pay Now
+            </button>
+          </div>
+        )}
+
         {activeTab === 'bookings' && (
           <div className="p-5 sm:p-6 overflow-y-auto overscroll-contain flex-1 space-y-4">
             {cancelFeedback && (
@@ -536,7 +645,7 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                               className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
                                 res.status === 'Confirmed'
                                   ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
-                                  : res.status === 'Pending Review'
+                                  : res.status === 'Pending Review' || res.status === 'Awaiting Downpayment'
                                   ? 'bg-amber-100 text-amber-900 border border-amber-300'
                                   : 'bg-rose-100 text-rose-900 border border-rose-300'
                               }`}
@@ -548,6 +657,13 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           <h4 className="font-serif font-bold text-base text-pine-950 mt-1">
                             {res.roomName}
                           </h4>
+
+                          {/* DITO LALABAS ANG ASSIGNED ROOM NI GUEST KAPAG CONFIRMED NA! */}
+                          {res.physicalRoomNumber && (
+                            <div className="mt-1 inline-block bg-emerald-50 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-200">
+                              Assigned Unit: {res.physicalRoomNumber}
+                            </div>
+                          )}
 
                           <div className="flex items-center gap-3 text-xs text-slate-500 mt-1 flex-wrap">
                             <span className="flex items-center gap-1">
@@ -589,9 +705,13 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           <div>
                             <span className="text-slate-400 block text-[10px] uppercase font-bold">Guest Details</span>
                             <span className="font-semibold text-slate-800">{res.fullName} ({res.numberOfGuests} Guests)</span>
-                            <span className="block text-slate-500">{res.email} • {res.contactNumber}</span>
+                            <span className="block text-slate-500">{res.email}<br/>{res.contactNumber}</span>
                           </div>
                           <div>
+                            <span className="text-slate-400 block text-[10px] uppercase font-bold">Assigned Unit</span>
+                            <span className="font-bold text-pine-700">{res.physicalRoomNumber || 'Not yet assigned'}</span>
+                          </div>
+                          <div className="sm:col-span-2">
                             <span className="text-slate-400 block text-[10px] uppercase font-bold">Special Requests</span>
                             <span className="italic">{res.specialRequests || 'None specified.'}</span>
                           </div>
@@ -635,14 +755,14 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           <button
                             type="button"
                             onClick={() => setCancellingId(null)}
-                            className="px-3 py-1.5 bg-white border border-stone-200 rounded-lg text-xs"
+                            className="px-3 py-1.5 bg-white border border-stone-200 rounded-lg text-xs cursor-pointer"
                           >
                             Back
                           </button>
                           <button
                             type="button"
                             onClick={() => handleConfirmCancel(res.id, res.reservationCode)}
-                            className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-lg text-xs"
+                            className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-lg text-xs cursor-pointer"
                           >
                             Confirm Cancel
                           </button>
@@ -698,7 +818,9 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           }`}>
                             {inv.paymentStatus}
                           </span>
-                          <span className="text-xs text-slate-500 font-medium">{inv.billingPeriod}</span>
+                          <span className="text-xs text-slate-500 font-bold bg-stone-100 px-2 py-0.5 rounded">
+                            {inv.stayType}
+                          </span>
                         </div>
 
                         <h4 className="font-serif font-bold text-sm text-pine-950 mt-1">
@@ -721,7 +843,7 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           <button
                             type="button"
                             onClick={() => setExpandedInvoiceId(prev => prev === inv.id ? null : inv.id)}
-                            className="px-2.5 sm:px-3 py-1.5 rounded-lg border border-stone-200 text-xs font-semibold text-slate-700 hover:bg-stone-50 transition-colors"
+                            className="px-2.5 sm:px-3 py-1.5 rounded-lg border border-stone-200 text-xs font-semibold text-slate-700 hover:bg-stone-50 transition-colors cursor-pointer"
                           >
                             {isExpanded ? 'Hide' : 'Breakdown'}
                           </button>
@@ -729,8 +851,12 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                           {!isPaid && (
                             <button
                               type="button"
-                              onClick={() => handleInitiatePaymentForInvoice(inv)}
-                              className="px-3 sm:px-3.5 py-1.5 rounded-lg bg-pine-950 hover:bg-black text-gold-200 font-bold text-xs shadow-xs transition-colors"
+                              onClick={() => {
+                                setSelectedInvoiceForPayment(inv.id);
+                                setPaymentAmount(inv.totalAmount);
+                                setActiveTab('payment');
+                              }}
+                              className="px-3 sm:px-3.5 py-1.5 rounded-lg bg-pine-950 hover:bg-black text-gold-200 font-bold text-xs shadow-xs transition-colors cursor-pointer"
                             >
                               Pay Online
                             </button>
@@ -741,27 +867,15 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
 
                     {isExpanded && (
                       <div className="p-4 sm:p-5 pt-0 border-t border-stone-100 bg-stone-50/60 text-xs space-y-3">
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3">
                           <div className="p-3 bg-white rounded-xl border border-stone-200">
-                            <span className="text-slate-400 block text-[10px] uppercase font-bold">Base Rental</span>
+                            <span className="text-slate-400 block text-[10px] uppercase font-bold">Billing Period</span>
+                            <span className="font-bold text-slate-900 text-sm">{inv.billingPeriod}</span>
+                          </div>
+
+                          <div className="p-3 bg-white rounded-xl border border-stone-200">
+                            <span className="text-slate-400 block text-[10px] uppercase font-bold">Amount Due</span>
                             <span className="font-bold text-slate-900 text-sm">₱{inv.rentAmount.toLocaleString()}</span>
-                            <span className="block text-[11px] text-slate-500 mt-0.5">{inv.stayType}</span>
-                          </div>
-
-                          <div className="p-3 bg-white rounded-xl border border-stone-200">
-                            <span className="text-sky-700 flex items-center gap-1 text-[10px] uppercase font-bold">
-                              <Droplet className="w-3 h-3 text-sky-600" />
-                              Water Utility
-                            </span>
-                            <span className="font-bold text-slate-900 text-sm">₱{inv.waterAmount.toLocaleString()}</span>
-                          </div>
-
-                          <div className="p-3 bg-white rounded-xl border border-stone-200">
-                            <span className="text-amber-700 flex items-center gap-1 text-[10px] uppercase font-bold">
-                              <Zap className="w-3 h-3 text-amber-600" />
-                              Electric Utility
-                            </span>
-                            <span className="font-bold text-slate-900 text-sm">₱{inv.electricityAmount.toLocaleString()}</span>
                           </div>
                         </div>
 
@@ -804,11 +918,12 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                     const inv = invoices.find(i => i.id === id);
                     if (inv) setPaymentAmount(inv.totalAmount);
                   }}
-                  className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium"
+                  className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium focus:ring-2 focus:ring-pine-700 focus:outline-none"
                 >
-                  {invoices.map((i) => (
+                  <option value="" disabled>-- Select Pending Invoice --</option>
+                  {invoices.filter(i => i.paymentStatus !== 'Paid').map((i) => (
                     <option key={i.id} value={i.id}>
-                      {i.invoiceNumber} — {i.roomOrBed} ({i.billingPeriod}) — ₱{i.totalAmount.toLocaleString()} [{i.paymentStatus}]
+                      {i.invoiceNumber} — {i.roomOrBed} ({i.stayType}) — ₱{i.totalAmount.toLocaleString()}
                     </option>
                   ))}
                 </select>
@@ -822,26 +937,26 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                   <select
                     value={paymentMethod}
                     onChange={(e) => setPaymentMethod(e.target.value as any)}
-                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium"
+                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium focus:ring-2 focus:ring-pine-700 focus:outline-none"
                   >
                     <option value="GCash">GCash (0907 861 4267)</option>
                     <option value="Maya">Maya (0907 861 4267)</option>
                     <option value="Bank Transfer">BDO / BPI Bank Transfer</option>
-                    <option value="Cash">Over-the-Counter Cash (Front Desk)</option>
+                    <option value="Cash">Over-the-Counter Cash</option>
                   </select>
                 </div>
 
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Reference / Transaction Number
+                    Reference Number
                   </label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. GC-9284719284 or BDO-01924"
+                    placeholder="e.g. GC-9284719284"
                     value={referenceNumber}
                     onChange={(e) => setReferenceNumber(e.target.value)}
-                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium"
+                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium focus:ring-2 focus:ring-pine-700 focus:outline-none"
                   />
                 </div>
               </div>
@@ -849,14 +964,14 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Account Sender Name (Optional)
+                    Sender Name (Optional)
                   </label>
                   <input
                     type="text"
                     placeholder="e.g. Juan Dela Cruz"
                     value={accountName}
                     onChange={(e) => setAccountName(e.target.value)}
-                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium"
+                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-medium focus:ring-2 focus:ring-pine-700 focus:outline-none"
                   />
                 </div>
 
@@ -869,7 +984,7 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                     required
                     value={paymentAmount}
                     onChange={(e) => setPaymentAmount(Number(e.target.value))}
-                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-bold"
+                    className="w-full p-2.5 bg-white border border-stone-300 rounded-xl text-xs text-slate-800 font-bold focus:ring-2 focus:ring-pine-700 focus:outline-none"
                   />
                 </div>
               </div>
@@ -898,13 +1013,13 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
                     <div className="mt-3 inline-block relative">
                       <img
                         src={receiptFilePreview}
-                        alt="Receipt preview"
-                        className="max-h-24 rounded-lg border border-stone-200 shadow-xs"
+                        alt="Preview"
+                        className="max-h-24 rounded-lg border shadow-xs"
                       />
                       <button
                         type="button"
                         onClick={() => setReceiptFilePreview(null)}
-                        className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-0.5"
+                        className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-0.5 cursor-pointer"
                       >
                         <X className="w-3 h-3" />
                       </button>
@@ -915,11 +1030,11 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
 
               <button
                 type="submit"
-                disabled={isSubmittingPayment}
+                disabled={isSubmittingPayment || !selectedInvoiceForPayment}
                 className="w-full py-3 rounded-xl bg-pine-950 hover:bg-black text-gold-200 font-bold text-xs shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 {isSubmittingPayment ? (
-                  <span>Submitting Payment...</span>
+                  <span>Submitting...</span>
                 ) : (
                   <>
                     <ShieldCheck className="w-4 h-4 text-emerald-400" />
@@ -931,6 +1046,7 @@ export const MyReservationsModal: React.FC<MyReservationsModalProps> = ({
           </div>
         )}
 
+        {/* INQUIRIES TAB */}
         {activeTab === 'inquiries' && (
           <div className="p-4 sm:p-6 overflow-y-auto overscroll-contain flex-1 space-y-4">
             

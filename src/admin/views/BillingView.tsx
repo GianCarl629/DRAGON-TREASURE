@@ -33,7 +33,10 @@ export const BillingView: React.FC<BillingViewProps> = ({
         .select('*')
         .order('created_at', { ascending: false });
 
-      if (data && data.length > 0) {
+      if (error) {
+        console.error("Error fetching billing records:", error);
+        setBillingRecords([]); // Blangko kapag may error
+      } else if (data && data.length > 0) {
         const formatted: AdminBillingRecord[] = data.map((b: any) => ({
           id: b.id,
           invoiceNumber: b.invoice_number,
@@ -52,13 +55,12 @@ export const BillingView: React.FC<BillingViewProps> = ({
         }));
         setBillingRecords(formatted);
       } else {
-        const store = AdminDataManager.loadStore();
-        setBillingRecords(store.billing || INITIAL_ADMIN_BILLING);
+        // TULUYAN NANG TINANGGAL ANG DUMMY DATA FALLBACK
+        setBillingRecords([]); // Blangko talaga kapag walang laman ang Supabase
       }
     } catch (err) {
-      console.warn("Notice: Falling back to local billing data:", err);
-      const store = AdminDataManager.loadStore();
-      setBillingRecords(store.billing || INITIAL_ADMIN_BILLING);
+      console.error("Error fetching billing records:", err);
+      setBillingRecords([]); // Blangko kapag may error sa pag-fetch
     } finally {
       setIsLoading(false);
     }
@@ -302,7 +304,7 @@ export const BillingView: React.FC<BillingViewProps> = ({
                     </span>
                   </div>
                   <div className="text-xs text-slate-600 font-medium mt-0.5">
-                    {rec.roomOrBed} • {rec.billingPeriod}
+                    {rec.roomOrBed} <br /> {rec.billingPeriod}
                   </div>
                   {rec.dueDate && (
                     <div className="text-[11px] text-slate-500 mt-0.5">
@@ -370,8 +372,8 @@ export const BillingView: React.FC<BillingViewProps> = ({
                 </tr>
               ) : filteredRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="py-12 text-center text-slate-400 text-xs">
-                    No billing statements found.
+                  <td colSpan={11} className="py-12 text-center text-slate-400 text-xs font-medium">
+                    No billing statements found in the database.
                   </td>
                 </tr>
               ) : (

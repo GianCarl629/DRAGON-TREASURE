@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Users, Check, Eye, CalendarCheck, Star } from 'lucide-react';
 import { Room } from '../../types';
+import { supabase } from '../../lib/supabase'; // Idinagdag para sa live count
 
 interface RoomCardProps {
   room: Room;
@@ -10,6 +11,32 @@ interface RoomCardProps {
 
 export const RoomCard: React.FC<RoomCardProps> = ({ room, onSelect, onBook }) => {
   const isDorm = room.category === 'dormitory';
+  
+  // State para sa live na bilang ng available rooms
+  const [availableCount, setAvailableCount] = useState<number | string>('...'); 
+
+ useEffect (() => {
+    const fetchLiveAvailability = async () => {
+      try {
+        const { count, error } = await supabase
+          .from('room_units')
+          .select('*', { count: 'exact', head: true })
+          .eq('room_type', room.name)
+          .eq('status', 'Available');
+
+        if (!error && count !== null) {
+          setAvailableCount(count);
+        } else {
+          // Fallback sa default kung may error o wala pang data
+          setAvailableCount(room.sampleQuantity);
+        }
+      } catch (err) {
+        setAvailableCount(room.sampleQuantity);
+      }
+    };
+
+    fetchLiveAvailability();
+  }, [room.name, room.sampleQuantity]);
 
   return (
     <div className="group relative bg-white/95 backdrop-blur-sm rounded-3xl overflow-hidden border border-stone-200/90 shadow-card hover:shadow-luxury-hover hover:-translate-y-1.5 transition-all duration-300 flex flex-col justify-between">
@@ -48,7 +75,7 @@ export const RoomCard: React.FC<RoomCardProps> = ({ room, onSelect, onBook }) =>
         {/* Quantity Indicator with Live Pulse Dot */}
         <div className="absolute top-3.5 right-3.5 bg-white/95 backdrop-blur-md px-3 py-1 rounded-full text-[11px] font-medium text-slate-700 border border-stone-200/80 shadow-xs flex items-center gap-1.5 z-10">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span>Available: <strong className="text-pine-950 font-bold">{room.sampleQuantity}</strong></span>
+          <span>Available: <strong className="text-pine-950 font-bold">{availableCount}</strong></span>
         </div>
 
         {/* Capacity overlay */}

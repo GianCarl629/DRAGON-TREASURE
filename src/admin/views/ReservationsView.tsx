@@ -18,11 +18,13 @@ import {
   AlertTriangle,
   X,
   Check,
-  ArrowRight
+  ArrowRight,
+  Receipt,
+  DoorOpen,
+  Image as ImageIcon
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 import { SAMPLE_ROOMS } from '../../data/mockData';
-import { AdminDataManager, INITIAL_ADMIN_RESERVATIONS } from '../data/adminMockData';
 
 interface AdminReservation {
   id: string;
@@ -39,12 +41,13 @@ interface AdminReservation {
   rate: number;
   ratePeriod: string;
   totalAmount: number;
-  status: 'Pending Review' | 'Confirmed' | 'Completed' | 'Cancelled';
+  status: 'Pending Review' | 'Awaiting Downpayment' | 'Confirmed' | 'Completed' | 'Cancelled';
   paymentStatus: 'Paid' | 'Pending' | 'Partial' | 'Unpaid';
   specialRequests?: string;
   cancellationReason?: string;
   bookedAt?: string;
   physicalRoomNumber?: string;
+  hasUploadedReceipt?: boolean;
 }
 
 interface ReservationsViewProps {
@@ -55,7 +58,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
   initialFilter
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'All' | 'Pending Review' | 'Confirmed' | 'Cancelled' | 'Completed'>(
+  const [statusFilter, setStatusFilter] = useState<'All' | 'Pending Review' | 'Awaiting Downpayment' | 'Confirmed' | 'Cancelled' | 'Completed'>(
     (initialFilter as any) || 'All'
   );
   const [categoryFilter, setCategoryFilter] = useState<'All' | 'transient' | 'dormitory'>('All');
@@ -66,26 +69,52 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
 
   const fetchPhysicalRooms = async () => {
     try {
-      const { data } = await supabase.from('room_units').select('id, room_number, room_type, status').eq('status', 'Available');
+      const { data } = await supabase
+        .from('room_units')
+        .select('id, room_number, room_type, status')
+        .eq('status', 'Available');
+      
       if (data) setAvailablePhysicalRooms(data);
     } catch {
-      // silent
+      // silent fallback
     }
   };
 
   const fetchReservations = async () => {
     setIsLoading(true);
     try {
-      const { data, error } = await supabase.from('reservations').select('*').order('created_at', { ascending: false });
+      if (!isSupabaseConfigured()) {
+        setLiveReservations([]);
+        setIsLoading(false);
+        return;
+      }
 
-      if (error || !data || data.length === 0) {
-        console.warn('Notice: Using baseline reservations data:', error);
-        const store = AdminDataManager.loadStore();
-        setLiveReservations((store.reservations as any) || (INITIAL_ADMIN_RESERVATIONS as any));
+      const { data: resData, error: resError } = await supabase
+        .from('reservations')
+        .select('*')
+        .order('created_at', { ascending: false });
+        
+      const { data: billingData } = await supabase
+        .from('billing_records')
+        .select('*');
+
+      if (resError || !resData || resData.length === 0) {
+        setLiveReservations([]);
       } else {
-        const formattedData: AdminReservation[] = data.map((res: any) => {
+        const formattedData: AdminReservation[] = resData.map((res: any) => {
           const rawType = String(res.room_type || res.room_id || '');
           const cleanRoomType = rawType.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+          const expectedPeriod = `${res.check_in_date || res.check_in || ''} to ${res.check_out_date || res.check_out || ''}`.trim();
+
+          // 3-WAY MATCHING LOGIC (Name + Period + Downpayment Type)
+          const hasUploadedReceipt = billingData?.some((b: any) => {
+            const matchName = b.tenant_or_guest?.toLowerCase().trim() === String(res.guest_name || '').toLowerCase().trim();
+            const matchPeriod = b.billing_period?.trim() === expectedPeriod;
+            const isDownpaymentInvoice = b.type === 'Downpayment';
+            const hasPaymentData = (b.payment_status === 'Paid' || b.payment_reference || b.receipt_url);
+            
+            return matchName && matchPeriod && isDownpaymentInvoice && hasPaymentData;
+          }) || false;
 
           return {
             id: res.id,
@@ -106,15 +135,14 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
             paymentStatus: (res.payment_status as any) || 'Pending',
             specialRequests: res.special_requests || '',
             cancellationReason: res.cancellation_reason || '',
-            physicalRoomNumber: res.physical_room_number || ''
+            physicalRoomNumber: res.physical_room_number || '',
+            hasUploadedReceipt
           };
         });
         setLiveReservations(formattedData);
       }
     } catch (err) {
-      console.warn('Notice: Error fetching reservations, using baseline:', err);
-      const store = AdminDataManager.loadStore();
-      setLiveReservations((store.reservations as any) || (INITIAL_ADMIN_RESERVATIONS as any));
+      setLiveReservations([]);
     } finally {
       setIsLoading(false);
     }
@@ -127,6 +155,10 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
     const channel = supabase
       .channel('admin-reservations-realtime')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'reservations' }, () => {
+        fetchReservations();
+        fetchPhysicalRooms();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'billing_records' }, () => {
         fetchReservations();
       })
       .subscribe();
@@ -142,26 +174,196 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
     }
   }, [initialFilter]);
 
-  const handleLiveConfirm = async (id: string) => {
-    await supabase.from('reservations').update({ status: 'Confirmed' }).eq('id', id);
-    fetchReservations();
+  // ==========================================
+  // APPROVE FOR DOWNPAYMENT
+  // ==========================================
+  const handleApproveForDownpayment = async (res: AdminReservation) => {
+    setLiveReservations(prev => prev.map(r => r.id === res.id ? { ...r, status: 'Awaiting Downpayment' } : r));
+
+    const targetPeriod = `${res.checkIn} to ${res.checkOut}`;
+    
+    // --- BURAHIN ANG 100% INVOICE ---
+    try {
+      await supabase
+        .from('billing_records')
+        .delete()
+        .ilike('tenant_or_guest', res.guestName.trim())
+        .eq('billing_period', targetPeriod)
+        .eq('type', 'Transient Stay');
+    } catch (e) {
+        console.error(e);
+    }
+
+    // Check if DP invoice already exists
+    const { data: existingInvoices } = await supabase
+      .from('billing_records')
+      .select('id')
+      .ilike('tenant_or_guest', res.guestName.trim())
+      .eq('billing_period', targetPeriod)
+      .eq('type', 'Downpayment');
+
+    if (!existingInvoices || existingInvoices.length === 0) {
+      const dpAmount = res.totalAmount / 2; // 50% DP
+
+      const invoicePayload = {
+        invoice_number: `DP-${Math.floor(1000 + Math.random() * 9000)}`,
+        tenant_or_guest: res.guestName.trim(),
+        room_or_bed: res.roomName,
+        type: 'Downpayment',
+        billing_period: targetPeriod,
+        rent_amount: dpAmount,
+        water_amount: 0,
+        electricity_amount: 0,
+        deposit_amount: 0,
+        total_amount: dpAmount,
+        payment_status: 'Pending',
+        due_date: res.checkIn 
+      };
+      
+      await supabase.from('billing_records').insert([invoicePayload]);
+    }
+
+    await supabase.from('reservations').update({ status: 'Awaiting Downpayment' }).eq('id', res.id);
   };
 
-  const handleLiveCancel = async (id: string, reason: string) => {
-    await supabase.from('reservations').update({ status: 'Cancelled', cancellation_reason: reason }).eq('id', id);
-    fetchReservations();
+  const [confirmingRes, setConfirmingRes] = useState<AdminReservation | null>(null);
+  const [selectedPhysicalRoom, setSelectedPhysicalRoom] = useState<string>('');
+  const [guestProofOfPayment, setGuestProofOfPayment] = useState<any>(null);
+  
+  const handleOpenConfirm = async (res: AdminReservation) => {
+    setConfirmingRes(res);
+    setSelectedPhysicalRoom('');
+    setGuestProofOfPayment(null);
+
+    if (isSupabaseConfigured()) {
+      const targetPeriod = `${res.checkIn} to ${res.checkOut}`;
+      
+      // Pull only the DOWNPAYMENT invoice
+      const { data } = await supabase
+        .from('billing_records')
+        .select('*')
+        .ilike('tenant_or_guest', res.guestName.trim())
+        .eq('billing_period', targetPeriod)
+        .eq('type', 'Downpayment')
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (data && data.length > 0) {
+        setGuestProofOfPayment(data[0]);
+      }
+    }
   };
 
-  const handleLiveDelete = async (id: string) => {
-    if (window.confirm("Pudno kadi a kayatmo a burasen daytoy a reserbasyon? Paspasigem tapno malinisan ti data.")) {
-      await supabase.from('reservations').delete().eq('id', id);
-      fetchReservations();
+  // ==========================================
+  // CONFIRM DP & ASSIGN ROOM -> BALANCE INVOICE
+  // ==========================================
+  const handleConfirmPaymentAndRoom = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!confirmingRes) return;
+    if (!selectedPhysicalRoom) {
+      alert("Please select a physical room to assign to this guest.");
+      return;
+    }
+
+    // Optimistic UI Update
+    setLiveReservations(prev => prev.map(r => 
+      r.id === confirmingRes.id 
+        ? { ...r, status: 'Confirmed', paymentStatus: 'Partial', physicalRoomNumber: selectedPhysicalRoom } 
+        : r
+    ));
+    
+    const cachedRes = confirmingRes;
+    setConfirmingRes(null);
+
+    try {
+      // 1. Deduct the room
+      const selectedUnit = availablePhysicalRooms.find(r => r.room_number === selectedPhysicalRoom);
+      if (selectedUnit) {
+        await supabase.from('room_units').update({ status: 'Reserved' }).eq('id', selectedUnit.id);
+      }
+
+      // 2. Update reservation
+      const { error: updateError } = await supabase.from('reservations').update({ 
+        status: 'Confirmed',
+        payment_status: 'Partial',
+        physical_room_number: selectedPhysicalRoom
+      }).eq('id', cachedRes.id);
+
+      if (updateError) {
+        alert("ERROR: Could not save the room assignment. Please ensure the physical_room_number column exists.");
+        console.error(updateError);
+        fetchReservations(); // Revert screen UI
+        return;
+      }
+
+      // 3. Mark DP as Paid
+      if (guestProofOfPayment) {
+        await supabase.from('billing_records').update({ payment_status: 'Paid' }).eq('id', guestProofOfPayment.id);
+      }
+
+      // 4. Create Balance Invoice
+      const targetPeriod = `${cachedRes.checkIn} to ${cachedRes.checkOut}`;
+      const balanceAmount = cachedRes.totalAmount / 2;
+      
+      const { data: existingBalance } = await supabase
+        .from('billing_records')
+        .select('id')
+        .ilike('tenant_or_guest', cachedRes.guestName.trim())
+        .eq('billing_period', targetPeriod)
+        .eq('type', 'Balance Payment');
+
+      if (!existingBalance || existingBalance.length === 0) {
+        const balancePayload = {
+          invoice_number: `BAL-${Math.floor(1000 + Math.random() * 9000)}`,
+          tenant_or_guest: cachedRes.guestName.trim(),
+          room_or_bed: `Unit ${selectedPhysicalRoom} (${cachedRes.roomName})`,
+          type: 'Balance Payment',
+          billing_period: targetPeriod,
+          rent_amount: balanceAmount,
+          water_amount: 0,
+          electricity_amount: 0,
+          deposit_amount: 0,
+          total_amount: balanceAmount,
+          payment_status: 'Pending',
+          due_date: cachedRes.checkOut // Due on checkout
+        };
+        await supabase.from('billing_records').insert([balancePayload]);
+      }
+
+    } catch (error) {
+      console.error(error);
     }
   };
 
   const handleUpdatePayment = async (id: string, paymentStatus: string) => {
+    setLiveReservations(prev => prev.map(r => r.id === id ? { ...r, paymentStatus: paymentStatus as any } : r));
     await supabase.from('reservations').update({ payment_status: paymentStatus }).eq('id', id);
-    fetchReservations();
+  };
+
+  const handleLiveCancel = async (id: string, reason: string) => {
+    const targetRes = liveReservations.find(r => r.id === id);
+    setLiveReservations(prev => prev.map(r => r.id === id ? { ...r, status: 'Cancelled' } : r));
+    
+    await supabase.from('reservations').update({ status: 'Cancelled', cancellation_reason: reason }).eq('id', id);
+
+    if (targetRes?.physicalRoomNumber) {
+      await supabase.from('room_units').update({ status: 'Available' }).eq('room_number', targetRes.physicalRoomNumber);
+      fetchPhysicalRooms();
+    }
+  };
+
+  const handleLiveDelete = async (id: string) => {
+    if (window.confirm("Are you sure you want to permanently delete this reservation? This action cannot be undone.")) {
+      const targetRes = liveReservations.find(r => r.id === id);
+      setLiveReservations(prev => prev.filter(r => r.id !== id));
+      
+      await supabase.from('reservations').delete().eq('id', id);
+
+      if (targetRes?.physicalRoomNumber) {
+        await supabase.from('room_units').update({ status: 'Available' }).eq('room_number', targetRes.physicalRoomNumber);
+        fetchPhysicalRooms();
+      }
+    }
   };
 
   const [selectedReservation, setSelectedReservation] = useState<AdminReservation | null>(null);
@@ -171,7 +373,6 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
 
   const [cancellingRes, setCancellingRes] = useState<AdminReservation | null>(null);
   const [cancelReason, setCancelReason] = useState('');
-
   const [editFormData, setEditFormData] = useState<Partial<AdminReservation>>({});
 
   const [newFormData, setNewFormData] = useState({
@@ -186,7 +387,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
     guests: SAMPLE_ROOMS[0].capacity,
     rate: SAMPLE_ROOMS[0].rate,
     ratePeriod: SAMPLE_ROOMS[0].ratePeriod,
-    status: 'Confirmed' as 'Pending Review' | 'Confirmed',
+    status: 'Confirmed' as 'Pending Review' | 'Awaiting Downpayment' | 'Confirmed',
     paymentStatus: 'Paid' as 'Paid' | 'Pending' | 'Unpaid',
     specialRequests: ''
   });
@@ -209,7 +410,6 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
       r.reservationCode.toLowerCase().includes(searchQuery.toLowerCase()) ||
       r.guestName.toLowerCase().includes(searchQuery.toLowerCase()) ||
       r.roomName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      r.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
       r.phone.includes(searchQuery);
 
     const matchesStatus = statusFilter === 'All' || r.status === statusFilter;
@@ -232,6 +432,17 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedReservation && editFormData) {
+      setLiveReservations(prev => prev.map(r => r.id === selectedReservation.id ? { ...r, ...editFormData } as any : r));
+      setIsEditModalOpen(false);
+
+      if (editFormData.physicalRoomNumber && editFormData.physicalRoomNumber !== selectedReservation.physicalRoomNumber) {
+        if (selectedReservation.physicalRoomNumber) {
+          await supabase.from('room_units').update({ status: 'Available' }).eq('room_number', selectedReservation.physicalRoomNumber);
+        }
+        await supabase.from('room_units').update({ status: 'Reserved' }).eq('room_number', editFormData.physicalRoomNumber);
+        fetchPhysicalRooms();
+      }
+
       await supabase.from('reservations').update({
         guest_name: editFormData.guestName,
         guest_phone: editFormData.phone,
@@ -241,10 +452,8 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         payment_status: editFormData.paymentStatus,
         physical_room_number: editFormData.physicalRoomNumber
       }).eq('id', selectedReservation.id);
-
-      setIsEditModalOpen(false);
+      
       setSelectedReservation(null);
-      fetchReservations();
     }
   };
 
@@ -253,14 +462,15 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
     const checkInDate = new Date(newFormData.checkIn);
     const checkOutDate = new Date(newFormData.checkOut);
     let diffDays = 1;
+    
     if (!isNaN(checkInDate.getTime()) && !isNaN(checkOutDate.getTime())) {
       const diffTime = checkOutDate.getTime() - checkInDate.getTime();
       diffDays = Math.max(1, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
     }
-    const computedTotal =
-      newFormData.category === 'transient'
-        ? (Number(newFormData.rate) || 1500) * diffDays
-        : Number(newFormData.rate) || 8000;
+    
+    const computedTotal = newFormData.category === 'transient'
+      ? (Number(newFormData.rate) || 1500) * diffDays
+      : Number(newFormData.rate) || 8000;
 
     const payload = {
       reservation_code: `DT-${Math.floor(100 + Math.random() * 900)}`,
@@ -300,6 +510,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
   return (
     <div className="space-y-6">
 
+      {/* --- HEADER --- */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="font-serif font-bold text-2xl text-pine-950 flex items-center gap-2">
@@ -309,7 +520,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
             </span>
           </h2>
           <p className="text-xs text-slate-600">
-            Review incoming transient guest requests, confirm bookings, and manage check-in dates.
+            Review incoming transient guest requests, confirm bookings, and assign physical rooms.
           </p>
         </div>
 
@@ -323,6 +534,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         </button>
       </div>
 
+      {/* --- FILTERS --- */}
       <div className="p-4 rounded-3xl bg-[#fffdfa] border border-gold-200/90 shadow-card space-y-3">
         <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
 
@@ -340,21 +552,23 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
           </div>
 
           <div className="flex items-center gap-1 overflow-x-auto pb-1 md:pb-0 scrollbar-none">
-            {(['All', 'Pending Review', 'Confirmed', 'Cancelled'] as const).map((tab) => (
+            {(['All', 'Pending Review', 'Awaiting Downpayment', 'Confirmed', 'Cancelled'] as const).map((tab) => (
               <button
                 key={tab}
                 type="button"
                 onClick={() => setStatusFilter(tab)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all cursor-pointer ${statusFilter === tab
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all cursor-pointer ${
+                  statusFilter === tab
                     ? 'bg-gradient-to-r from-gold-500 to-gold-600 text-white shadow-xs font-bold'
                     : 'text-slate-600 hover:text-pine-900 hover:bg-gold-50'
                   }`}
               >
                 {tab}
-                {tab === 'Pending Review' && (
-                  <span className={`ml-1.5 px-1.5 py-0.2 rounded-full text-[10px] font-bold ${statusFilter === tab ? 'bg-pine-950 text-gold-300' : 'bg-amber-100 text-amber-900'
-                    }`}>
-                    {liveReservations.filter(r => r.status === 'Pending Review').length}
+                {(tab === 'Pending Review' || tab === 'Awaiting Downpayment') && (
+                  <span className={`ml-1.5 px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
+                    statusFilter === tab ? 'bg-pine-950 text-gold-300' : 'bg-amber-100 text-amber-900'
+                  }`}>
+                    {liveReservations.filter(r => r.status === tab).length}
                   </span>
                 )}
               </button>
@@ -376,10 +590,11 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
 
       <div className="bg-[#fffdfa] border border-gold-200/90 rounded-3xl overflow-hidden shadow-card">
         
+        {/* --- MOBILE VIEW --- */}
         <div className="block md:hidden divide-y divide-gold-200/60">
           {filteredReservations.length === 0 ? (
-            <div className="py-12 px-4 text-center text-slate-400 text-xs">
-              No reservations matching current search and filter criteria.
+            <div className="py-12 px-4 text-center text-slate-400 text-xs font-medium">
+              No reservations found. Database is empty.
             </div>
           ) : (
             filteredReservations.map((res) => (
@@ -389,12 +604,25 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                     {res.reservationCode}
                   </span>
 
-                  <div>
+                  <div className="flex items-center gap-1.5">
                     {res.status === 'Pending Review' ? (
                       <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300 inline-flex items-center gap-1">
                         <Clock className="w-2.5 h-2.5 text-amber-700" />
                         <span>Pending Review</span>
                       </span>
+                    ) : res.status === 'Awaiting Downpayment' ? (
+                      <>
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-900 border border-blue-300 inline-flex items-center gap-1">
+                          <Receipt className="w-2.5 h-2.5 text-blue-700" />
+                          <span>Awaiting DP</span>
+                        </span>
+                        {res.hasUploadedReceipt && (
+                          <span className="px-2 py-0.5 rounded-md text-[9px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 inline-flex items-center gap-1 animate-pulse shadow-sm">
+                            <CheckCircle2 className="w-2.5 h-2.5" />
+                            Receipt Ready
+                          </span>
+                        )}
+                      </>
                     ) : res.status === 'Confirmed' ? (
                       <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 inline-flex items-center gap-1">
                         <CheckCircle2 className="w-2.5 h-2.5" />
@@ -423,6 +651,11 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                   <div className="text-xs text-slate-600 font-medium mt-0.5">
                     {res.roomName} • {res.guests} Guests
                   </div>
+                  {res.physicalRoomNumber && (
+                    <div className="mt-1 inline-block bg-pine-100 text-pine-900 text-[10px] font-bold px-2 py-0.5 rounded border border-pine-200">
+                      Assigned Room: {res.physicalRoomNumber}
+                    </div>
+                  )}
                   <div className="text-[11px] text-slate-500 flex items-center gap-2 mt-1">
                     <a href={`tel:${res.phone}`} className="text-pine-800 font-semibold hover:underline flex items-center gap-1">
                       <Phone className="w-3 h-3" />
@@ -470,20 +703,40 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                     {res.status === 'Pending Review' && (
                       <button
                         type="button"
-                        onClick={() => handleLiveConfirm(res.id)}
-                        className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1"
-                        title="Confirm reservation request"
+                        onClick={() => handleApproveForDownpayment(res)}
+                        className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1"
                       >
-                        <Check className="w-3.5 h-3.5" />
-                        <span>Confirm</span>
+                        <CreditCard className="w-3.5 h-3.5" />
+                        <span>Approve for DP</span>
                       </button>
+                    )}
+
+                    {res.status === 'Awaiting Downpayment' && (
+                      res.hasUploadedReceipt ? (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenConfirm(res)}
+                          className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1 ring-2 ring-emerald-300"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Check DP</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled
+                          className="px-2.5 py-1.5 bg-slate-100 text-slate-400 rounded-lg text-xs font-bold border border-slate-200 flex items-center gap-1 cursor-not-allowed"
+                        >
+                          <Clock className="w-3.5 h-3.5" />
+                          <span>Waiting for DP...</span>
+                        </button>
+                      )
                     )}
 
                     <button
                       type="button"
                       onClick={() => handleOpenView(res)}
                       className="p-1.5 rounded-lg bg-stone-100 hover:bg-gold-100 text-slate-700 hover:text-pine-950 transition-colors cursor-pointer border border-stone-200"
-                      title="View Details"
                     >
                       <Eye className="w-4 h-4 text-pine-700" />
                     </button>
@@ -492,7 +745,6 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                       type="button"
                       onClick={() => handleOpenEdit(res)}
                       className="p-1.5 rounded-lg bg-stone-100 hover:bg-gold-100 text-slate-700 hover:text-pine-950 transition-colors cursor-pointer border border-stone-200"
-                      title="Edit"
                     >
                       <Edit3 className="w-4 h-4 text-pine-700" />
                     </button>
@@ -502,7 +754,6 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                         type="button"
                         onClick={() => handlePromptCancel(res)}
                         className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 transition-colors cursor-pointer border border-rose-200"
-                        title="Cancel"
                       >
                         <XCircle className="w-4 h-4 text-rose-600" />
                       </button>
@@ -511,7 +762,6 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                         type="button"
                         onClick={() => handleLiveDelete(res.id)}
                         className="p-1.5 rounded-lg bg-stone-100 hover:bg-stone-200 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer border border-stone-200"
-                        title="Delete"
                       >
                         <Trash2 className="w-4 h-4 text-slate-400" />
                       </button>
@@ -523,15 +773,15 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
           )}
         </div>
 
+        {/* --- DESKTOP VIEW --- */}
         <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="text-[11px] uppercase tracking-wider text-pine-950 border-b border-gold-200/80 bg-gold-50/60">
               <tr>
                 <th className="py-3.5 px-4 font-bold">Reservation ID</th>
                 <th className="py-3.5 px-4 font-bold">Guest</th>
-                <th className="py-3.5 px-4 font-bold">Room Category & Physical Unit</th>
-                <th className="py-3.5 px-4 font-bold">Check-in</th>
-                <th className="py-3.5 px-4 font-bold">Check-out</th>
+                <th className="py-3.5 px-4 font-bold">Room Category & Unit</th>
+                <th className="py-3.5 px-4 font-bold">Check-in / Out</th>
                 <th className="py-3.5 px-4 font-bold">Status</th>
                 <th className="py-3.5 px-4 font-bold">Payment</th>
                 <th className="py-3.5 px-4 font-bold text-right">Admin Actions</th>
@@ -540,7 +790,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
             <tbody className="divide-y divide-gold-100/70">
               {isLoading ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-500 font-semibold">
+                  <td colSpan={7} className="py-12 text-center text-slate-500 font-semibold">
                     <div className="flex justify-center items-center gap-2">
                        <div className="w-4 h-4 border-2 border-gold-500 border-t-transparent rounded-full animate-spin"></div>
                        Loading reservations...
@@ -549,8 +799,8 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                 </tr>
               ) : filteredReservations.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-400 text-xs">
-                    No reservations matching current search and filter criteria.
+                  <td colSpan={7} className="py-12 text-center text-slate-400 text-xs font-medium">
+                    No reservations found. Database is empty.
                   </td>
                 </tr>
               ) : (
@@ -576,12 +826,9 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                       )}
                     </td>
 
-                    <td className="py-3.5 px-4 whitespace-nowrap text-slate-700 font-medium">
-                      {res.checkIn}
-                    </td>
-
-                    <td className="py-3.5 px-4 whitespace-nowrap text-slate-700 font-medium">
-                      {res.checkOut}
+                    <td className="py-3.5 px-4 whitespace-nowrap">
+                      <div className="text-slate-700 font-bold">{res.checkIn}</div>
+                      <div className="text-slate-500 text-[10px]">to {res.checkOut}</div>
                     </td>
 
                     <td className="py-3.5 px-4 whitespace-nowrap">
@@ -590,6 +837,19 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                           <Clock className="w-2.5 h-2.5 text-amber-700" />
                           <span>Pending Review</span>
                         </span>
+                      ) : res.status === 'Awaiting Downpayment' ? (
+                        <div className="flex flex-col gap-1.5 items-start">
+                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-900 border border-blue-300 inline-flex items-center gap-1">
+                            <Receipt className="w-2.5 h-2.5 text-blue-700" />
+                            <span>Awaiting DP</span>
+                          </span>
+                          {res.hasUploadedReceipt && (
+                            <span className="px-2 py-0.5 rounded-md text-[9px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 inline-flex items-center gap-1 shadow-xs">
+                              <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />
+                              Receipt Ready
+                            </span>
+                          )}
+                        </div>
                       ) : res.status === 'Confirmed' ? (
                         <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 inline-flex items-center gap-1">
                           <CheckCircle2 className="w-2.5 h-2.5" />
@@ -611,12 +871,13 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                       <select
                         value={res.paymentStatus}
                         onChange={(e) => handleUpdatePayment(res.id, e.target.value)}
-                        className={`text-[11px] font-bold px-2 py-0.5 rounded-lg border cursor-pointer focus:outline-none bg-stone-50 ${res.paymentStatus === 'Paid'
+                        className={`text-[11px] font-bold px-2 py-0.5 rounded-lg border cursor-pointer focus:outline-none bg-stone-50 ${
+                          res.paymentStatus === 'Paid'
                             ? 'text-emerald-800 border-emerald-300 bg-emerald-50/70'
                             : res.paymentStatus === 'Pending' || res.paymentStatus === 'Partial'
                               ? 'text-amber-800 border-amber-300 bg-amber-50/70'
                               : 'text-rose-800 border-rose-300 bg-rose-50/70'
-                          }`}
+                        }`}
                       >
                         <option value="Paid">Paid</option>
                         <option value="Pending">Pending</option>
@@ -631,13 +892,36 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                         {res.status === 'Pending Review' && (
                           <button
                             type="button"
-                            onClick={() => handleLiveConfirm(res.id)}
-                            className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1"
-                            title="Confirm reservation request"
+                            onClick={() => handleApproveForDownpayment(res)}
+                            className="px-2.5 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1"
+                            title="Approve for DP & Generate Billing"
                           >
-                            <Check className="w-3 h-3" />
-                            <span>Confirm</span>
+                            <CreditCard className="w-3 h-3" />
+                            <span>Approve for DP</span>
                           </button>
+                        )}
+
+                        {res.status === 'Awaiting Downpayment' && (
+                          res.hasUploadedReceipt ? (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenConfirm(res)}
+                              className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer flex items-center gap-1 ring-2 ring-emerald-300 ring-offset-1"
+                              title="Verify Payment & Assign Room"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Check DP</span>
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled
+                              className="px-2.5 py-1.5 bg-slate-100 text-slate-400 rounded-lg text-xs font-bold border border-slate-200 flex items-center gap-1 cursor-not-allowed"
+                            >
+                              <Clock className="w-3.5 h-3.5" />
+                              <span>Waiting for DP...</span>
+                            </button>
+                          )
                         )}
 
                         <button
@@ -689,6 +973,114 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         </div>
       </div>
 
+      {/* --- MGA MODALS --- */}
+
+      {/* 1. Confirm DP & Assign Room Modal */}
+      {confirmingRes && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in">
+          <form onSubmit={handleConfirmPaymentAndRoom} className="bg-white border border-stone-200 rounded-3xl max-w-md w-full p-4 sm:p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center gap-3 text-pine-900 border-b border-stone-200 pb-3">
+              <DoorOpen className="w-5 h-5 flex-shrink-0" />
+              <div>
+                <h3 className="font-bold text-sm">Verify Payment & Assign Room</h3>
+                <p className="text-xs text-slate-500">Confirm downpayment for {confirmingRes.guestName}</p>
+              </div>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              
+              {/* PROOF OF PAYMENT SECTION */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-2">
+                  Client Proof of Payment
+                </span>
+                
+                {guestProofOfPayment && (guestProofOfPayment.payment_reference || guestProofOfPayment.receipt_url) ? (
+                  <div className="space-y-2">
+                    <div className="flex justify-between items-center text-slate-800">
+                      <span className="font-medium">Channel:</span>
+                      <span className="font-bold">{guestProofOfPayment.payment_method || 'Online Payment'}</span>
+                    </div>
+                    {guestProofOfPayment.payment_reference && (
+                      <div className="flex justify-between items-center text-slate-800">
+                        <span className="font-medium">Reference No:</span>
+                        <span className="font-bold text-pine-700 bg-pine-50 px-2 py-0.5 rounded border border-pine-200">
+                          {guestProofOfPayment.payment_reference}
+                        </span>
+                      </div>
+                    )}
+                    
+                    {guestProofOfPayment.receipt_url && (
+                      <div className="mt-4 p-2 bg-white rounded-xl border border-stone-200">
+                        <span className="font-bold text-[10px] text-slate-400 uppercase tracking-wider block mb-2">
+                          Receipt Screenshot:
+                        </span>
+                        <img 
+                          src={guestProofOfPayment.receipt_url} 
+                          alt="Proof of Payment" 
+                          className="w-full max-h-60 object-contain rounded shadow-sm bg-stone-50"
+                        />
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-amber-700 bg-amber-50 p-2 rounded-lg border border-amber-200">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                    <span className="font-medium">No payment details uploaded by the guest yet.</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-3 bg-stone-50 rounded-xl border border-stone-200 flex justify-between items-center">
+                <span className="text-slate-500 font-semibold">Requested Room Type:</span>
+                <span className="font-bold text-pine-950">{confirmingRes.roomName}</span>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-slate-800 font-bold block">Select Available Physical Unit</label>
+                <select
+                  required
+                  value={selectedPhysicalRoom}
+                  onChange={(e) => setSelectedPhysicalRoom(e.target.value)}
+                  className="w-full bg-white border border-stone-300 rounded-xl p-3 text-xs text-slate-900 font-semibold focus:outline-none focus:ring-2 focus:ring-pine-700"
+                >
+                  <option value="">-- Choose an available unit --</option>
+                  {availablePhysicalRooms
+                    .filter(room => {
+                      const dbRoomType = confirmingRes.roomType.toLowerCase().replace(/ /g, '-');
+                      const unitType = room.room_type.toLowerCase().replace(/ /g, '-');
+                      return dbRoomType === unitType;
+                    })
+                    .map(room => (
+                      <option key={room.id} value={room.room_number}>
+                        Unit {room.room_number} ({room.room_type})
+                      </option>
+                  ))}
+                </select>
+                <p className="text-[10px] text-slate-500">This will automatically deduct the room from inventory and mark payment as Partial.</p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-stone-200">
+              <button
+                type="button"
+                onClick={() => setConfirmingRes(null)}
+                className="px-4 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold cursor-pointer flex items-center gap-1"
+              >
+                <Check className="w-3.5 h-3.5" /> Confirm DP & Assign
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* 2. View Modal */}
       {isViewModalOpen && selectedReservation && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in">
           <div className="bg-white border border-stone-200 rounded-3xl max-w-lg w-full max-h-[92vh] overflow-y-auto p-4 sm:p-6 space-y-4 shadow-2xl">
@@ -785,12 +1177,24 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    handleLiveConfirm(selectedReservation.id);
+                    handleApproveForDownpayment(selectedReservation);
                     setIsViewModalOpen(false);
+                  }}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold cursor-pointer"
+                >
+                  Approve for DP
+                </button>
+              )}
+              {selectedReservation.status === 'Awaiting Downpayment' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsViewModalOpen(false);
+                    handleOpenConfirm(selectedReservation);
                   }}
                   className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold cursor-pointer"
                 >
-                  Approve Reservation
+                  Confirm DP & Assign
                 </button>
               )}
               <button
@@ -805,6 +1209,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         </div>
       )}
 
+      {/* 3. Cancel Prompt Modal */}
       {cancellingRes && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in">
           <div className="bg-white border border-stone-200 rounded-3xl max-w-md w-full max-h-[92vh] overflow-y-auto p-4 sm:p-6 space-y-4 shadow-2xl">
@@ -851,6 +1256,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         </div>
       )}
 
+      {/* 4. Edit Modal */}
       {isEditModalOpen && selectedReservation && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in">
           <form onSubmit={handleSaveEdit} className="bg-white border border-stone-200 rounded-3xl max-w-lg w-full max-h-[92vh] overflow-y-auto p-4 sm:p-6 space-y-4 shadow-2xl">
@@ -938,6 +1344,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                   className="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-slate-900 text-xs"
                 >
                   <option value="Pending Review">Pending Review</option>
+                  <option value="Awaiting Downpayment">Awaiting Downpayment</option>
                   <option value="Confirmed">Confirmed</option>
                   <option value="Completed">Completed</option>
                   <option value="Cancelled">Cancelled</option>
@@ -978,6 +1385,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
         </div>
       )}
 
+      {/* 5. Add New Modal */}
       {isAddModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-pine-950/70 backdrop-blur-sm animate-fade-in">
           <form onSubmit={handleCreateNew} className="bg-white border border-stone-200 rounded-3xl max-w-lg w-full max-h-[92vh] overflow-y-auto p-4 sm:p-6 space-y-4 shadow-2xl">
@@ -1065,6 +1473,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                 >
                   <option value="Confirmed">Confirmed</option>
                   <option value="Pending Review">Pending Review</option>
+                  <option value="Awaiting Downpayment">Awaiting Downpayment</option>
                 </select>
               </div>
 
@@ -1076,6 +1485,7 @@ export const ReservationsView: React.FC<ReservationsViewProps> = ({
                   className="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-slate-900 text-xs"
                 >
                   <option value="Paid">Paid</option>
+                  <option value="Partial">Partial</option>
                   <option value="Pending">Pending</option>
                   <option value="Unpaid">Unpaid</option>
                 </select>
